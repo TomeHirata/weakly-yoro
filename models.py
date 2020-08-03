@@ -5,12 +5,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy as np
+from torchvision import models
 
 from utils.parse_config import *
-from utils.utils import build_targets, to_cpu, non_max_suppression
+from utils.utils import build_targets, to_cpu, non_max_suppression, bbox_iou
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from torchvision.ops import roi_align
+import time
 
 
 def create_modules(module_defs):
@@ -75,6 +78,17 @@ def create_modules(module_defs):
             img_size = int(hyperparams["height"])
             # Define detection layer
             yolo_layer = YOLOLayer(anchors, num_classes, img_size)
+            modules.add_module(f"yolo_{module_i}", yolo_layer)
+        elif module_def["type"] == "weakly_yolo":
+            anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
+            # Extract anchors
+            anchors = [int(x) for x in module_def["anchors"].split(",")]
+            anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
+            anchors = [anchors[i] for i in anchor_idxs]
+            num_classes = int(module_def["classes"])
+            img_size = int(hyperparams["height"])
+            # Define detection layer
+            yolo_layer = WeaklyYOLOLayer(anchors, num_classes, img_size)
             modules.add_module(f"yolo_{module_i}", yolo_layer)
         # Register module list and number of output filters
         module_list.append(modules)
@@ -230,6 +244,171 @@ class YOLOLayer(nn.Module):
 
             return output, total_loss
 
+class WeaklyYOLOLayer(YOLOLayer):
+    """Detection layer"""
+
+    def __init__(self, anchors, num_classes, img_dim=416, use_feature_loss=False):
+        super(WeaklyYOLOLayer, self).__init__(anchors, num_classes, img_dim=416)
+        self.roi_feature_size = (7, 7)
+        self.feature_channel = 512
+        self.use_feature_loss = use_feature_loss
+        if use_feature_loss:
+            self.fc = nn.Sequential(
+                nn.Linear(512 * 7 * 7, 4096),
+                nn.ReLU(True),
+                nn.Dropout(),
+            )
+            self.classifier = nn.Sequential(
+                nn.Linear(4096, 4096),
+                nn.ReLU(True),
+                nn.Dropout(),
+                nn.Linear(4096, num_classes),
+            )
+            self.detector = nn.Sequential(
+                nn.Linear(4096, 4096),
+                nn.ReLU(True),
+                nn.Dropout(),
+                nn.Linear(4096, num_classes),
+            )
+        else:
+            self.classifier = nn.Sequential(
+                nn.Linear(512 * 7 * 7, 4096),
+                nn.ReLU(True),
+                nn.Dropout(),
+                nn.Linear(4096, num_classes),
+            )
+            self.detector = nn.Sequential(
+                nn.Linear(512 * 7 * 7, 4096),
+                nn.ReLU(True),
+                nn.Dropout(),
+                nn.Linear(4096, num_classes),
+            )
+
+    def forward(self, x, targets=None, img_dim=None, feature=None):
+
+        # Tensors for cuda support
+        FloatTensor = torch.cuda.FloatTensor if x.is_cuda else torch.FloatTensor
+        LongTensor = torch.cuda.LongTensor if x.is_cuda else torch.LongTensor
+        ByteTensor = torch.cuda.ByteTensor if x.is_cuda else torch.ByteTensor
+
+        self.img_dim = img_dim
+        num_samples = x.size(0)
+        grid_size = x.size(2)
+
+        prediction = (
+            x.view(num_samples, self.num_anchors, self.num_classes + 5, grid_size, grid_size)
+            .permute(0, 1, 3, 4, 2)
+            .contiguous()
+        )
+
+        # Get outputs
+        x = torch.sigmoid(prediction[..., 0])  # Center x
+        y = torch.sigmoid(prediction[..., 1])  # Center y
+        w = prediction[..., 2]  # Width
+        h = prediction[..., 3]  # Height
+        pred_conf = torch.sigmoid(prediction[..., 4])  # Conf
+        pred_cls = torch.sigmoid(prediction[..., 5:])  # Cls pred.
+
+        # If grid size does not match current we compute new offsets
+        if grid_size != self.grid_size:
+            self.compute_grid_offsets(grid_size, cuda=x.is_cuda)
+
+        # Add offset and scale with anchors
+        pred_boxes = FloatTensor(prediction[..., :4].shape)
+        pred_boxes[..., 0] = x.data + self.grid_x
+        pred_boxes[..., 1] = y.data + self.grid_y
+        pred_boxes[..., 2] = torch.exp(w.data) * self.anchor_w
+        pred_boxes[..., 3] = torch.exp(h.data) * self.anchor_h
+
+        output = torch.cat(
+            (
+                pred_boxes.view(num_samples, -1, 4) * self.stride,
+                pred_conf.view(num_samples, -1, 1),
+                pred_cls.view(num_samples, -1, self.num_classes),
+            ),
+            -1,
+        )
+
+        if targets is None or feature is None:
+            return output, 0
+        else:
+            spatial_scale = feature.shape[-1] / self.img_dim
+            _pred_boxes = pred_boxes.view(num_samples, -1, 4)
+            n_box = _pred_boxes.size(1)
+            class_prediction = FloatTensor(num_samples, n_box, self.num_classes).fill_(0)
+            box_prediction = FloatTensor(num_samples, n_box, self.num_classes).fill_(0)
+            if self.use_feature_loss:
+                roi_features = FloatTensor(num_samples, n_box, 4096).fill_(0)
+            # cariculate the true labels
+            b, target_labels = targets[:, :2].long().t()
+            tlabels = FloatTensor(num_samples, self.num_classes).fill_(0)
+            for i in range(num_samples):
+                tlabels[b[i], target_labels[i]] = 1
+            # proposed boxes
+            x1x2y1y2 = FloatTensor(_pred_boxes.shape).fill_(0)
+            x1x2y1y2[:, :, 0], x1x2y1y2[:, :, 2] = _pred_boxes[:, :, 0] - _pred_boxes[:, :, 2] / 2, _pred_boxes[:, :, 0] + _pred_boxes[:, :, 2] / 2
+            x1x2y1y2[:, :, 1], x1x2y1y2[:, :, 3] = _pred_boxes[:, :, 1] - _pred_boxes[:, :, 3] / 2, _pred_boxes[:, :, 1] + _pred_boxes[:, :, 3] / 2
+            # pred class and confidence from box features
+            t = time.time()
+            for i in range(n_box):
+                box = [_pred_boxes[:, i]]
+                roi_feature = roi_align(feature, box, self.roi_feature_size, spatial_scale = spatial_scale).view(num_samples, -1)
+                if self.use_feature_loss:
+                    roi_feature = self.fc(roi_feature)
+                    roi_features[:, i] = roi_feature
+                class_prediction[:, i] = self.classifier(roi_feature)
+                box_prediction[:, i] = self.detector(roi_feature)
+            # print(time.time()-t)
+            
+            class_prediction = torch.softmax(class_prediction, dim=2)
+            box_prediction = torch.softmax(class_prediction, dim=1)
+            classifier_pred_labels = (class_prediction * box_prediction).sum(dim=1)
+            yolo_pred_labels, yoro_max_box = (pred_conf.view(num_samples, -1, 1) * pred_cls.view(num_samples, -1, self.num_classes)).max(dim=1)
+            yoro_loss = self.bce_loss(yolo_pred_labels, tlabels)
+            classifier_loss = self.bce_loss(classifier_pred_labels, tlabels)
+            box_loss = 0
+            for i in range(num_samples):
+                for c in range(self.num_classes):
+                    if tlabels[i][c].item() == 0:
+                        continue
+                    max_box = _pred_boxes[i, yoro_max_box[i, c]].unsqueeze(0)
+                    if self.use_feature_loss:
+                        box_loss += torch.abs(roi_features[i, yoro_max_box[i, c]].unsqueeze(0) - roi_features[i, bbox_iou(max_box, _pred_boxes[i]) > 0.5]).sum() / num_samples / self.num_classes
+                    else:
+                        box_loss += torch.abs(max_box - _pred_boxes[i, bbox_iou(max_box, _pred_boxes[i]) > 0.5]).sum() / num_samples / self.num_classes
+            total_loss = yoro_loss + classifier_loss + box_loss
+            
+            iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf = build_targets(
+                pred_boxes=pred_boxes,
+                pred_cls=pred_cls,
+                target=targets,
+                anchors=self.scaled_anchors,
+                ignore_thres=self.ignore_thres,
+            )
+
+            # Metrics
+            cls_acc = 100 * class_mask[obj_mask].mean()
+            # conf_obj = pred_conf[obj_mask].mean()
+            # conf_noobj = pred_conf[noobj_mask].mean()
+            conf50 = (pred_conf > 0.5).float()
+            iou50 = (iou_scores > 0.5).float()
+            iou75 = (iou_scores > 0.75).float()
+            detected_mask = conf50 * class_mask * tconf
+            precision = torch.sum(iou50 * detected_mask) / (conf50.sum() + 1e-16)
+            recall50 = torch.sum(iou50 * detected_mask) / (obj_mask.sum() + 1e-16)
+            recall75 = torch.sum(iou75 * detected_mask) / (obj_mask.sum() + 1e-16)
+
+            self.metrics = {
+                "loss": to_cpu(total_loss).item(),
+                "cls_acc": to_cpu(cls_acc).item(),
+                "recall50": to_cpu(recall50).item(),
+                "recall75": to_cpu(recall75).item(),
+                "precision": to_cpu(precision).item(),
+                "grid_size": grid_size,
+            }
+
+            return output, total_loss
+
 
 class Darknet(nn.Module):
     """YOLOv3 object detection model"""
@@ -343,3 +522,33 @@ class Darknet(nn.Module):
                 conv_layer.weight.data.cpu().numpy().tofile(fp)
 
         fp.close()
+
+class YoloNet(Darknet):
+    def __init__(self, config_path, img_size=416, feature_config_path='config/feature-exstractor.cfg', pretrained=True):
+        super(YoloNet, self).__init__(config_path, img_size)
+        base_model = models.vgg16(pretrained=pretrained)
+        self.feature_module_defs = parse_model_config(feature_config_path)
+        self.feature_net = base_model.features
+
+    def forward(self, x, targets=None):
+        img_dim = x.shape[2]
+        loss = 0
+        layer_outputs, yolo_outputs = [], []
+        features = self.feature_net(x)
+        
+        for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
+            if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
+                x = module(x)
+            elif module_def["type"] == "route":
+                x = torch.cat([layer_outputs[int(layer_i)] for layer_i in module_def["layers"].split(",")], 1)
+            elif module_def["type"] == "shortcut":
+                layer_i = int(module_def["from"])
+                x = layer_outputs[-1] + layer_outputs[layer_i]
+            elif module_def["type"] == "weakly_yolo":
+                x, layer_loss = module[0](x, targets, img_dim, features)
+                loss += layer_loss
+                yolo_outputs.append(x)
+            layer_outputs.append(x)
+        yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
+        return yolo_outputs if targets is None else (loss, yolo_outputs)
+        

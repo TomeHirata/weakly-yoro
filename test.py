@@ -50,6 +50,8 @@ def evaluate(model, path, iou_thres, conf_thres, nms_thres, img_size, batch_size
         sample_metrics += get_batch_statistics(outputs, targets, iou_threshold=iou_thres)
 
     # Concatenate sample statistics
+    if len(sample_metrics) == 0:
+        return np.zeros([5,1])
     true_positives, pred_scores, pred_labels = [np.concatenate(x, 0) for x in list(zip(*sample_metrics))]
     precision, recall, AP, f1, ap_class = ap_per_class(true_positives, pred_scores, pred_labels, labels)
 
@@ -61,6 +63,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8, help="size of each image batch")
     parser.add_argument("--model_def", type=str, default="config/yolov3.cfg", help="path to model definition file")
     parser.add_argument("--data_config", type=str, default="config/coco.data", help="path to data config file")
+    parser.add_argument("--data_type", type=str, default="coco", help="path to data config file")
+    parser.add_argument("--data_year", type=str, default="2014", help="dataset year")
+    parser.add_argument("--data_root", type=str, default="/data", help="dataset root path")
     parser.add_argument("--weights_path", type=str, default="weights/yolov3.weights", help="path to weights file")
     parser.add_argument("--class_path", type=str, default="data/coco.names", help="path to class label file")
     parser.add_argument("--iou_thres", type=float, default=0.5, help="iou threshold required to qualify as detected")
@@ -68,6 +73,9 @@ if __name__ == "__main__":
     parser.add_argument("--nms_thres", type=float, default=0.5, help="iou thresshold for non-maximum suppression")
     parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
     parser.add_argument("--img_size", type=int, default=416, help="size of each image dimension")
+    parser.add_argument('--gpus', type=str, default='0', help='visible GPU ids, separated by comma')
+    parser.add_argument('--result_dir', type=str, default='/data', help='namespace')
+    parser.add_argument('--weakly', type=str, default=False, help='weakly supervised or not')
     opt = parser.parse_args()
     print(opt)
 
@@ -78,7 +86,10 @@ if __name__ == "__main__":
     class_names = load_classes(data_config["names"])
 
     # Initiate model
-    model = Darknet(opt.model_def).to(device)
+    if opt.weakly:
+        model = YoloNet(opt.model_def).cuda()
+    else:
+        model = Darknet(opt.model_def).cuda()
     if opt.weights_path.endswith(".weights"):
         # Load darknet weights
         model.load_darknet_weights(opt.weights_path)

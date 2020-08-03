@@ -8,5 +8,6 @@ output
 data/coco
 backup
 weights/*.weights
+weights/darknet53.conv.74
 __pycache__
 checkpoints
